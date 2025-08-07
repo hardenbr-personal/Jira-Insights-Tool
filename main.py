@@ -122,20 +122,18 @@ else:
     exit()
 
 # Step 3: Prepare issues for GPT
-max_issues = 50
 issues = recent_issues if mode == "2" else requests.get(search_url, params={
     "jql": jql,
-    "maxResults": max_issues,
+    "maxResults": 50,
     "fields": "key,summary,description,status,issuetype,assignee"
-}).json().get("issues", [])[:max_issues]
-
+}).json().get("issues", [])
 print(f"✅ Pulled {len(issues)} issues")
 
 if not issues:
     print("⚠️ No matching issues found. Exiting without GPT summary.")
     exit()
 
-# Step 4: Batch GPT summaries
+# Step 4: Batch GPT summary
 prompt_chunks = []
 for issue in issues:
     key = issue["key"]
@@ -145,13 +143,10 @@ for issue in issues:
 
 batched_prompt = "\n\n".join(prompt_chunks)
 
-batched_summary_response = client.chat.completions.create(
+response = client.chat.completions.create(
     model="gpt-3.5-turbo",
     messages=[
-        {"role": "system", "content": (
-            "You are an expert Jira analyst. For each issue below, generate a one-line summary.\n"
-            "Format: KEY: One-line summary"
-        )},
+        {"role": "system", "content": "You are an expert Jira analyst. For each issue below, generate a one-line summary. Format: ISSUE_KEY: One-line summary."},
         {"role": "user", "content": batched_prompt}
     ],
     temperature=0.3,
@@ -159,7 +154,7 @@ batched_summary_response = client.chat.completions.create(
 )
 
 summary_map = {}
-for line in batched_summary_response.choices[0].message.content.strip().split("\n"):
+for line in response.choices[0].message.content.strip().split("\n"):
     if ": " in line:
         key, summary_line = line.strip().split(": ", 1)
         summary_map[key.strip()] = summary_line.strip()
@@ -191,10 +186,10 @@ input_text = "\n\n".join([
 print("\n📌 Current Open Work Summary:\n")
 print(input_text)
 
-# Step 6: Optional thematic clustering and follow-ups
+# Step 6: Thematic clustering (batched)
 if mode == "1":
     deep_prompt = (
-        "Group these Jira issues into thematic clusters based on their descriptions and summaries.\n"
+        "Group these Jira issues into thematic clusters based on their summaries.\n"
         "For each theme, include:\n"
         "1. A few representative issues with links (keep the ticket name/number and link on the same line).\n"
         "2. A list of follow-up questions the team should consider for this theme (e.g. blockers, ownership, coordination)."
@@ -207,7 +202,7 @@ if mode == "1":
             {"role": "user", "content": f"Here are the Jira issues:\n\n{input_text}\n\n{deep_prompt}"}
         ],
         temperature=0.5,
-        max_tokens=900
+        max_tokens=1000
     )
 
     print("\n📊 Thematic Clusters & Follow-Up Questions:\n")
