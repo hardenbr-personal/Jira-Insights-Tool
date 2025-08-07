@@ -122,37 +122,49 @@ else:
     exit()
 
 # Step 3: Prepare issues for GPT
+max_issues = 50
 issues = recent_issues if mode == "2" else requests.get(search_url, params={
     "jql": jql,
-    "maxResults": 100,
+    "maxResults": max_issues,
     "fields": "key,summary,description,status,issuetype,assignee"
-}).json().get("issues", [])
+}).json().get("issues", [])[:max_issues]
+
 print(f"✅ Pulled {len(issues)} issues")
 
 if not issues:
     print("⚠️ No matching issues found. Exiting without GPT summary.")
     exit()
 
-# Step 4: Generate summaries for each issue via GPT
-summarized = []
+# Step 4: Batch GPT summaries
+prompt_chunks = []
 for issue in issues:
     key = issue["key"]
     summary = issue["fields"]["summary"]
     description = (issue["fields"].get("description") or "").strip()
-    gpt_input = f"{key}: {summary}\n\n{description}"
+    prompt_chunks.append(f"{key}: {summary}\n{description}")
 
-    resp = client.chat.completions.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": "Summarize this Jira issue in one sentence."},
-            {"role": "user", "content": gpt_input}
-        ],
-        temperature=0.3,
-        max_tokens=60
-    )
+batched_prompt = "\n\n".join(prompt_chunks)
 
-    summary_line = resp.choices[0].message.content.strip()
-    summarized.append((issue, summary_line))
+batched_summary_response = client.chat.completions.create(
+    model="gpt-3.5-turbo",
+    messages=[
+        {"role": "system", "content": (
+            "You are an expert Jira analyst. For each issue below, generate a one-line summary.\n"
+            "Format: KEY: One-line summary"
+        )},
+        {"role": "user", "content": batched_prompt}
+    ],
+    temperature=0.3,
+    max_tokens=2000
+)
+
+summary_map = {}
+for line in batched_summary_response.choices[0].message.content.strip().split("\n"):
+    if ": " in line:
+        key, summary_line = line.strip().split(": ", 1)
+        summary_map[key.strip()] = summary_line.strip()
+
+summarized = [(issue, summary_map.get(issue["key"], "")) for issue in issues]
 
 # Step 5: Structure the display format
 assigned_blurbs = []
