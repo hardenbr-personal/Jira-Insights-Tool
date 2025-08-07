@@ -4,6 +4,7 @@ import os
 import requests
 from datetime import datetime, timedelta
 from openai import OpenAI
+import re
 
 # Load environment variables
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
@@ -15,13 +16,17 @@ JIRA_SITE = "https://issues.apache.org/jira"
 PROJECT_KEY = "SPARK"
 search_url = f"{JIRA_SITE}/rest/api/2/search"
 
-# 🧐 Define version helpers
+# 😮 Define version helpers
 def get_latest_unreleased_version(versions):
-    unreleased = [v for v in versions if not v.get("released", False)]
-    if not unreleased:
-        print("⚠️ No unreleased versions found.")
+    spark_core_versions = [
+        v for v in versions
+        if not v.get("released", False)
+        and re.match(r"^\d+\.\d+(\.\d+)?$", v["name"])
+    ]
+    if not spark_core_versions:
+        print("⚠️ No matching unreleased Spark-core versions found.")
         exit()
-    return sorted(unreleased, key=lambda v: v["name"], reverse=True)[0]["name"]
+    return sorted(spark_core_versions, key=lambda v: v["name"], reverse=True)[0]["name"]
 
 def get_latest_released_version(versions):
     released = [v for v in versions if v.get("released", False) and "releaseDate" in v]
@@ -44,12 +49,13 @@ versions = version_response.json()
 # Step 2: Determine fixVersion and JQL based on mode
 if mode == "1":
     fix_version = get_latest_unreleased_version(versions)
+    print(f"🔍 Using fixVersion: {fix_version}")
     print(f"📦 Using unreleased fixVersion: {fix_version}")
     jql = (
         f'project = {PROJECT_KEY} AND fixVersion = "{fix_version}" '
         f'AND statusCategory != Done'
     )
-    gpt_prompt = "You are an expert Jira analyst. Summarize the current open work and suggest priorities."
+    gpt_prompt = "You are an expert Jira analyst. For each issue, generate a 1-line summary of its purpose or content."
 
 elif mode == "2":
     print("🔍 Looking for recent closed issues in latest released versions...")
@@ -60,7 +66,7 @@ elif mode == "2":
     for v in get_latest_released_version(versions):
         candidate_version = v["name"]
         print(f"🔎 Checking fixVersion: {candidate_version}")
-        
+
         temp_jql = (
             f'project = {PROJECT_KEY} AND fixVersion = "{candidate_version}" '
             f'AND statusCategory = Done AND issuetype IN (Bug, Task, Improvement)'
@@ -78,7 +84,6 @@ elif mode == "2":
         if not issues:
             continue
 
-        # Try to pull only those resolved within the last 14 days of the most recent ticket
         issues_sorted = sorted(
             issues,
             key=lambda x: x["fields"].get("resolutiondate", ""),
@@ -111,47 +116,87 @@ elif mode == "2":
         "You are facilitating a sprint retrospective. Summarize what was accomplished, recurring themes, "
         "and suggest discussion points for the team."
     )
+
 else:
     print("❌ Invalid mode. Exiting.")
     exit()
 
 # Step 3: Prepare issues for GPT
-print(f"✅ Pulled {len(recent_issues) if mode == '2' else 'N/A'} issues")
 issues = recent_issues if mode == "2" else requests.get(search_url, params={
     "jql": jql,
     "maxResults": 100,
-    "fields": "key,summary,description,status,issuetype"
+    "fields": "key,summary,description,status,issuetype,assignee"
 }).json().get("issues", [])
+print(f"✅ Pulled {len(issues)} issues")
 
 if not issues:
     print("⚠️ No matching issues found. Exiting without GPT summary.")
     exit()
 
-# Step 4: Format for GPT
-issue_blurbs = []
+# Step 4: Generate summaries for each issue via GPT
+summarized = []
 for issue in issues:
-    f = issue["fields"]
-    summary = f["summary"]
-    desc = f.get("description", "") or ""
     key = issue["key"]
-    type_ = f["issuetype"]["name"]
-    status = f["status"]["name"]
-    text = f"[{type_}] {key}: {summary} ({status})\n{desc.strip()}\n"
-    issue_blurbs.append(text)
+    summary = issue["fields"]["summary"]
+    description = (issue["fields"].get("description") or "").strip()
+    gpt_input = f"{key}: {summary}\n\n{description}"
 
-input_text = "\n".join(issue_blurbs)
+    resp = client.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "Summarize this Jira issue in one sentence."},
+            {"role": "user", "content": gpt_input}
+        ],
+        temperature=0.3,
+        max_tokens=60
+    )
 
-# Step 5: Send to GPT
-response = client.chat.completions.create(
-    model="gpt-4",
-    messages=[
-        {"role": "system", "content": gpt_prompt},
-        {"role": "user", "content": f"Here are the Jira issues:\n\n{input_text}"}
-    ],
-    temperature=0.4,
-    max_tokens=700
-)
+    summary_line = resp.choices[0].message.content.strip()
+    summarized.append((issue, summary_line))
 
-# Output summary
-print("\n📜 GPT Summary:\n")
-print(response.choices[0].message.content)
+# Step 5: Structure the display format
+assigned_blurbs = []
+unassigned_blurbs = []
+
+for issue, summary_line in summarized:
+    f = issue["fields"]
+    key = issue["key"]
+    summary = f["summary"]
+    assignee = f.get("assignee")
+
+    if assignee and assignee.get("displayName"):
+        text = f"{key}: {summary}\n{summary_line}\n👤 Assignee: {assignee['displayName']}"
+        assigned_blurbs.append(text)
+    else:
+        text = f"{key}: {summary}\n{summary_line}"
+        unassigned_blurbs.append(text)
+
+input_text = "\n\n".join([
+    "📌 Assigned:\n\n" + "\n\n".join(assigned_blurbs) if assigned_blurbs else "",
+    "⚪ Unassigned:\n\n" + "\n\n".join(unassigned_blurbs) if unassigned_blurbs else ""
+]).strip()
+
+print("\n📌 Current Open Work Summary:\n")
+print(input_text)
+
+# Step 6: Optional thematic clustering and follow-ups
+if mode == "1":
+    deep_prompt = (
+        "Group these Jira issues into thematic clusters based on their descriptions and summaries.\n"
+        "For each theme, include:\n"
+        "1. A few representative issues with links (keep the ticket name/number and link on the same line).\n"
+        "2. A list of follow-up questions the team should consider for this theme (e.g. blockers, ownership, coordination)."
+    )
+
+    deep_response = client.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "You are an expert Agile analyst."},
+            {"role": "user", "content": f"Here are the Jira issues:\n\n{input_text}\n\n{deep_prompt}"}
+        ],
+        temperature=0.5,
+        max_tokens=900
+    )
+
+    print("\n📊 Thematic Clusters & Follow-Up Questions:\n")
+    print(deep_response.choices[0].message.content)
